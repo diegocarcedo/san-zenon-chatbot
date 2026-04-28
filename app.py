@@ -1,88 +1,146 @@
-import os
-import pandas as pd
-import streamlit as st
-from pathlib import Path
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
+from __future__ import annotations
 
-st.set_page_config(page_title="San Zenón Chatbot", layout="wide")
+from pathlib import Path
+
+import streamlit as st
+from openai import OpenAI
+
+from rag_core import (
+    answer_question,
+    build_rag_store,
+    format_sources,
+    read_system_prompt,
+    retrieve_top_k,
+)
+
+st.set_page_config(page_title="San Zenón — Chatbot documental", layout="wide")
 st.title("San Zenón — Chatbot documental")
 
-DATA_DIR = Path("data/01_DOCUMENTS")
 INDEX_PATH = Path("data/00_INDEX/document_index.csv")
-DB_DIR = Path("chroma_db")
+DOCS_DIR = Path("data/01_DOCUMENTS")
+SYSTEM_PROMPT_PATH = Path("system_prompt.md")
 
-SYSTEM_PROMPT = Path("system_prompt.md").read_text(encoding="utf-8")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-@st.cache_resource
-def load_vectorstore():
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    if DB_DIR.exists():
-        return Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
+if "last_retrieved" not in st.session_state:
+    st.session_state.last_retrieved = []
 
-    index = pd.read_csv(INDEX_PATH)
-    docs = []
-    for _, row in index.iterrows():
-        pdf_path = DATA_DIR / row["Nuevo_nombre"]
-        if not pdf_path.exists():
-            continue
+api_key = st.secrets.get("OPENAI_API_KEY", "")
+if not api_key:
+    st.warning("Configura OPENAI_API_KEY en Streamlit Secrets para habilitar el chatbot.")
 
-        reader = PdfReader(str(pdf_path))
-        text = "\n".join([p.extract_text() or "" for p in reader.pages])
-        metadata = row.to_dict()
-        metadata["source_file"] = row["Nuevo_nombre"]
-        docs.append(Document(page_content=text, metadata=metadata))
+client = OpenAI(api_key=api_key) if api_key else None
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180)
-    chunks = splitter.split_documents(docs)
+if not INDEX_PATH.exists():
+    st.error(f"No se encontró el índice en: {INDEX_PATH}")
+    st.stop()
 
-    return Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=str(DB_DIR)
+import pandas as pd
+
+index_df = pd.read_csv(INDEX_PATH)
+
+with st.sidebar:
+    st.header("Filtros")
+    campanas = st.multiselect(
+        "Campaña",
+        options=sorted(index_df["Campaña"].dropna().astype(str).unique().tolist()),
+    )
+    tipos = st.multiselect(
+        "Tipo",
+        options=sorted(index_df["Tipo"].dropna().astype(str).unique().tolist()),
+    )
+    temas = st.multiselect(
+        "Tema_principal",
+        options=sorted(index_df["Tema_principal"].dropna().astype(str).unique().tolist()),
     )
 
-vectorstore = load_vectorstore()
+chat_tab, diag_tab = st.tabs(["Chat", "Diagnóstico"])
 
-question = st.chat_input("Preguntá sobre San Zenón...")
+store = None
+if client:
+    with st.spinner("Cargando corpus y generando embeddings..."):
+        store = build_rag_store(
+            client=client,
+            index_path=INDEX_PATH,
+            documents_dir=DOCS_DIR,
+            campanas=campanas,
+            tipos=tipos,
+            temas=temas,
+        )
 
-if "history" not in st.session_state:
-    st.session_state.history = []
+with chat_tab:
+    if not client:
+        st.info("El chat está deshabilitado hasta definir OPENAI_API_KEY en Secrets.")
+    elif store and store.diagnostics.pdfs_found == 0:
+        st.info("No hay PDFs disponibles todavía en data/01_DOCUMENTS. El chatbot está listo cuando cargues documentos.")
 
-for role, content in st.session_state.history:
-    with st.chat_message(role):
-        st.markdown(content)
+    for message in st.session_state.chat_history:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-if question:
-    st.session_state.history.append(("user", question))
-    with st.chat_message("user"):
-        st.markdown(question)
+    question = st.chat_input("Escribe tu pregunta sobre el corpus documental...")
+    if question:
+        st.session_state.chat_history.append({"role": "user", "content": question})
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-    retrieved = retriever.invoke(question)
+        with st.chat_message("user"):
+            st.markdown(question)
 
-    context = "\n\n".join([
-        f"FUENTE: {d.metadata.get('Codigo')} | {d.metadata.get('Fecha')} | {d.metadata.get('Tipo')} | {d.metadata.get('Tema_principal')}\n{d.page_content}"
-        for d in retrieved
-    ])
+        with st.chat_message("assistant"):
+            if not client or store is None:
+                answer = "No hay evidencia suficiente en el corpus documental disponible."
+                st.markdown(answer)
+            else:
+                retrieved = retrieve_top_k(store, question, client=client, k=6)
+                st.session_state.last_retrieved = retrieved
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", "Pregunta: {question}\n\nContexto documental recuperado:\n{context}")
-    ])
+                system_prompt = read_system_prompt(SYSTEM_PROMPT_PATH)
+                answer = answer_question(
+                    client=client,
+                    system_prompt=system_prompt,
+                    question=question,
+                    retrieved=retrieved,
+                )
+                st.markdown(answer)
 
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-    answer = llm.invoke(prompt.format_messages(question=question, context=context)).content
+                sources = format_sources(retrieved)
+                if sources:
+                    st.markdown("**Fuentes citadas**")
+                    for line in sources:
+                        st.markdown(line)
 
-    with st.chat_message("assistant"):
-        st.markdown(answer)
+        st.session_state.chat_history.append({"role": "assistant", "content": answer})
 
-    with st.expander("Fuentes recuperadas"):
-        for d in retrieved:
-            st.write(d.metadata)
+    with st.expander("Ver snippets recuperados"):
+        retrieved = st.session_state.get("last_retrieved", [])
+        if not retrieved:
+            st.write("Aún no hay snippets recuperados.")
+        else:
+            for score, chunk in retrieved:
+                st.markdown(
+                    f"**{chunk.codigo}** | {chunk.fecha} | {chunk.campana} | {chunk.nuevo_nombre} | score={score:.4f}"
+                )
+                st.write(chunk.text[:800] + ("..." if len(chunk.text) > 800 else ""))
+                st.divider()
 
-    st.session_state.history.append(("assistant", answer))
+with diag_tab:
+    if store is None:
+        st.info("Diagnóstico disponible al configurar OPENAI_API_KEY.")
+    else:
+        d = store.diagnostics
+        st.metric("documents in index", d.documents_in_index)
+        st.metric("PDFs found", d.pdfs_found)
+        st.metric("PDFs missing", len(d.pdfs_missing))
+        st.metric("unreadable PDFs", len(d.unreadable_pdfs))
+        st.metric("chunks created", d.chunks_created)
+
+        st.write("**metadata fields present**")
+        st.write(d.metadata_fields_present)
+
+        if d.pdfs_missing:
+            st.write("**Listado de PDFs faltantes**")
+            st.write(d.pdfs_missing)
+
+        if d.unreadable_pdfs:
+            st.write("**Listado de PDFs no legibles**")
+            st.write(d.unreadable_pdfs)
