@@ -1,0 +1,28 @@
+{
+  "project": "san_zenon_chatbot",
+  "language": "es",
+  "folder_structure": {
+    "00_INDEX": "metadata and document registry",
+    "01_DOCUMENTS": "source PDFs",
+    "02_PROMPTS": "system and task prompts",
+    "03_OUTPUTS": "generated summaries, reports, extracted tables"
+  },
+  "retrieval": {
+    "chunk_size": 1200,
+    "chunk_overlap": 180,
+    "top_k": 6,
+    "rerank": false,
+    "metadata_filters": [
+      "Fecha",
+      "Tipo",
+      "Campaña",
+      "Tema_principal",
+      "Codigo"
+    ]
+  },
+  "answer_policy": {
+    "cite_sources": true,
+    "prefer_recent_documents": true,
+    "do_not_invent": true
+  }
+}
