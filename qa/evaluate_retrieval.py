@@ -1,13 +1,8 @@
 from __future__ import annotations
 
 from pathlib import Path
-import sys
 
 from openai import OpenAI
-
-REPO_ROOT = Path(__file__).resolve().parents[1]
-if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
 
 from rag_core import build_rag_store, classify_query_intent, retrieve_top_k
 
