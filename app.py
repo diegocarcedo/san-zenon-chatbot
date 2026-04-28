@@ -1,88 +1,220 @@
-import os
+from __future__ import annotations
+
+from pathlib import Path
+
 import pandas as pd
 import streamlit as st
-from pathlib import Path
-from pypdf import PdfReader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_chroma import Chroma
-from langchain_core.documents import Document
-from langchain_core.prompts import ChatPromptTemplate
+from openai import OpenAI
 
-st.set_page_config(page_title="San Zenón Chatbot", layout="wide")
+from rag_core import (
+    answer_from_index_for_listing,
+    answer_question,
+    build_rag_store,
+    classify_query_intent,
+    format_sources,
+    read_system_prompt,
+    retrieve_top_k,
+)
+
+st.set_page_config(page_title="San Zenón — Chatbot documental", layout="wide")
 st.title("San Zenón — Chatbot documental")
 
-DATA_DIR = Path("data/01_DOCUMENTS")
 INDEX_PATH = Path("data/00_INDEX/document_index.csv")
-DB_DIR = Path("chroma_db")
+DOCS_DIR = Path("data/01_DOCUMENTS")
+SYSTEM_PROMPT_PATH = Path("system_prompt.md")
 
-SYSTEM_PROMPT = Path("system_prompt.md").read_text(encoding="utf-8")
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = []
 
-@st.cache_resource
-def load_vectorstore():
-    embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
-    if DB_DIR.exists():
-        return Chroma(persist_directory=str(DB_DIR), embedding_function=embeddings)
+if not INDEX_PATH.exists():
+    st.error(f"No se encontró el índice: {INDEX_PATH}")
+    st.stop()
 
-    index = pd.read_csv(INDEX_PATH)
-    docs = []
-    for _, row in index.iterrows():
-        pdf_path = DATA_DIR / row["Nuevo_nombre"]
-        if not pdf_path.exists():
-            continue
+index_df = pd.read_csv(INDEX_PATH)
+api_key = st.secrets.get("OPENAI_API_KEY", "")
+client = OpenAI(api_key=api_key) if api_key else None
 
-        reader = PdfReader(str(pdf_path))
-        text = "\n".join([p.extract_text() or "" for p in reader.pages])
-        metadata = row.to_dict()
-        metadata["source_file"] = row["Nuevo_nombre"]
-        docs.append(Document(page_content=text, metadata=metadata))
+with st.sidebar:
+    st.header("Panel de control")
+    campanas = st.multiselect("Campaña", sorted(index_df["Campaña"].dropna().astype(str).unique().tolist()))
+    tipos = st.multiselect("Tipo", sorted(index_df["Tipo"].dropna().astype(str).unique().tolist()))
+    temas = st.multiselect("Tema_principal", sorted(index_df["Tema_principal"].dropna().astype(str).unique().tolist()))
 
-    splitter = RecursiveCharacterTextSplitter(chunk_size=1200, chunk_overlap=180)
-    chunks = splitter.split_documents(docs)
+    if st.button("Clear conversation", use_container_width=True):
+        st.session_state.chat_history = []
+        st.rerun()
 
-    return Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=str(DB_DIR)
+    show_corpus_summary = st.button("Show corpus summary", use_container_width=True)
+
+    with st.expander("Documentos cargados", expanded=False):
+        st.dataframe(
+            index_df[["Codigo", "Fecha", "Campaña", "Tipo", "Tema_principal", "Nuevo_nombre"]],
+            use_container_width=True,
+            hide_index=True,
+        )
+
+    with st.expander("Limitaciones del corpus", expanded=False):
+        st.markdown(
+            """
+El corpus actual es útil para explorar reportes y notas históricas, pero es insuficiente para decisiones operativas completas.
+
+Datos recomendados:
+- livestock inventories by date/category
+- tacto reports across all years
+- paddock maps and surfaces
+- rainfall records
+- crop yields by lot/campaign
+- financial records
+- purchase/sale invoices
+- maintenance logs
+- veterinary reports
+- pasture/verdeo records
+- meeting minutes and decision logs
+"""
+        )
+
+    st.warning(
+        "Este chatbot responde solo con la documentación cargada. "
+        "No reemplaza asesoramiento técnico, contable, veterinario ni comercial."
     )
 
-vectorstore = load_vectorstore()
+if not api_key:
+    st.info("Configurá OPENAI_API_KEY en Streamlit Secrets para habilitar respuestas con modelo.")
+    store = None
+else:
+    with st.spinner("Preparando índice, chunks y embeddings..."):
+        store = build_rag_store(
+            client=client,
+            index_path=INDEX_PATH,
+            documents_dir=DOCS_DIR,
+            campanas=campanas,
+            tipos=tipos,
+            temas=temas,
+        )
 
-question = st.chat_input("Preguntá sobre San Zenón...")
+if store is not None:
+    with st.sidebar:
+        d = store.diagnostics
+        st.markdown("### Estado rápido")
+        st.caption(f"Documentos indexados: {d.documents_in_index}")
+        st.caption(f"Chunks: {d.chunks_created}")
+        st.caption(f"Cache: {d.cache_status}")
 
-if "history" not in st.session_state:
-    st.session_state.history = []
+        with st.expander("Diagnóstico", expanded=False):
+            st.write(f"documents in index: {d.documents_in_index}")
+            st.write(f"PDFs found: {d.pdfs_found}")
+            st.write(f"PDFs missing: {len(d.pdfs_missing)}")
+            st.write(f"unreadable files: {len(d.unreadable_pdfs)}")
+            st.write(f"chunks created: {d.chunks_created}")
+            st.write(f"cache status: {d.cache_status}")
+            st.write(f"metadata fields present: {d.metadata_fields_present}")
+            if d.pdfs_missing:
+                st.write("Missing:", d.pdfs_missing)
+            if d.unreadable_pdfs:
+                st.write("Unreadable:", d.unreadable_pdfs)
 
-for role, content in st.session_state.history:
-    with st.chat_message(role):
-        st.markdown(content)
+if not st.session_state.chat_history:
+    st.markdown(
+        """
+### Bienvenido
+**Qué podés preguntarle**
+- Consultas sobre reportes, resultados históricos y documentos disponibles.
 
+**Ejemplos de preguntas**
+- ¿Qué documentos hay disponibles?
+- ¿Qué documentos hablan de sequía?
+- ¿Qué documentos mencionan tacto o preñez?
+- ¿Qué documentos tratan temas financieros?
+- ¿Cómo impactó la sequía en los distintos años?
+- ¿Cuál fue el porcentaje de preñez en 2026?
+- ¿Podés resumir la estrategia general del campo?
+- ¿Qué datos faltan para tomar decisiones operativas?
+
+**Limitaciones del corpus**
+- Responde solo con documentación cargada y puede no cubrir toda la operación actual.
+"""
+    )
+
+if show_corpus_summary:
+    st.info(
+        f"Corpus visible actual: {len(index_df)} documentos en índice. "
+        "Usá ‘Documentos cargados’ en la barra lateral para ver el detalle."
+    )
+
+
+def evidence_label(answer_text: str, retrieved: list[dict]) -> str:
+    if "No hay evidencia suficiente en el corpus documental disponible." in answer_text:
+        return "Sin evidencia suficiente"
+    if not retrieved:
+        return "Evidencia parcial"
+    strong_hits = [r for r in retrieved if r.get("hybrid_score", 0) >= 0.55]
+    return "Evidencia fuerte" if len(strong_hits) >= 2 else "Evidencia parcial"
+
+
+for msg in st.session_state.chat_history:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+        if msg["role"] == "assistant":
+            st.caption(f"Confianza: **{msg.get('evidence_label', 'Evidencia parcial')}**")
+            if msg.get("evidence"):
+                with st.expander("Evidencia usada", expanded=False):
+                    for item in msg["evidence"]:
+                        ch = item["chunk"]
+                        st.markdown(
+                            f"**score={item['hybrid_score']:.4f}** "
+                            f"(vector={item['vector_score']:.4f}, keyword={item['keyword_score']:.4f}, "
+                            f"metadata={item['metadata_bonus']:.4f}, recency={item['recency_bonus']:.4f})"
+                        )
+                        st.markdown(
+                            f"`Codigo={ch.codigo}` | `Fecha={ch.fecha}` | `Campaña={ch.campana}` | `Tipo={ch.tipo}` | "
+                            f"`Tema_principal={ch.tema_principal}` | `Nuevo_nombre={ch.nuevo_nombre}`"
+                        )
+                        st.write(ch.text[:850] + ("..." if len(ch.text) > 850 else ""))
+                        st.divider()
+
+question = st.chat_input("Consultá el corpus documental...")
 if question:
-    st.session_state.history.append(("user", question))
-    with st.chat_message("user"):
-        st.markdown(question)
+    st.session_state.chat_history.append({"role": "user", "content": question})
 
-    retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-    retrieved = retriever.invoke(question)
+    intent = classify_query_intent(question)
+    answer = "No hay evidencia suficiente en el corpus documental disponible."
+    retrieved: list[dict] = []
 
-    context = "\n\n".join([
-        f"FUENTE: {d.metadata.get('Codigo')} | {d.metadata.get('Fecha')} | {d.metadata.get('Tipo')} | {d.metadata.get('Tema_principal')}\n{d.page_content}"
-        for d in retrieved
-    ])
+    if store is None:
+        answer = "No hay evidencia suficiente en el corpus documental disponible."
+    elif intent == "document_listing":
+        result = answer_from_index_for_listing(store, question)
+        answer = result["answer"]
+    elif intent == "ambiguous":
+        answer = "¿Te referís a resultados ganaderos, agrícolas, financieros, reproductivos o a una campaña específica?"
+    else:
+        top_k = 8 if intent == "historical_comparison" else 5
+        retrieved = retrieve_top_k(
+            store=store,
+            query=question,
+            client=client,
+            k=top_k,
+            campanas=campanas,
+            tipos=tipos,
+            temas=temas,
+        )
+        answer = answer_question(
+            client=client,
+            system_prompt=read_system_prompt(SYSTEM_PROMPT_PATH),
+            question=question,
+            retrieved=retrieved,
+            intent=intent,
+        )
+        source_lines = format_sources(retrieved)
+        if source_lines:
+            answer += "\n\n**Fuentes usadas**\n" + "\n".join(source_lines)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", "Pregunta: {question}\n\nContexto documental recuperado:\n{context}")
-    ])
-
-    llm = ChatOpenAI(model="gpt-4o-mini", temperature=0.1)
-    answer = llm.invoke(prompt.format_messages(question=question, context=context)).content
-
-    with st.chat_message("assistant"):
-        st.markdown(answer)
-
-    with st.expander("Fuentes recuperadas"):
-        for d in retrieved:
-            st.write(d.metadata)
-
-    st.session_state.history.append(("assistant", answer))
+    st.session_state.chat_history.append(
+        {
+            "role": "assistant",
+            "content": answer,
+            "evidence": retrieved,
+            "evidence_label": evidence_label(answer, retrieved),
+        }
+    )
+    st.rerun()
