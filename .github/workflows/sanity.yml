@@ -1,0 +1,30 @@
+name: Sanity
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  sanity:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Compile Python files
+        run: |
+          python -m py_compile app.py rag_core.py qa/validate_app_sanity.py qa/run_ingestion_checks.py
+
+      - name: Run app sanity
+        run: python qa/validate_app_sanity.py
+
+      - name: Run ingestion checks
+        run: python qa/run_ingestion_checks.py --allow-missing-pdfs
